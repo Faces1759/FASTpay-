@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+db.sqlite3
+venv/
+env/
+*.egg-info/
+media/
+staticfiles/
+.env
+.vscode/
+.DS_Store
+Thumbs.db
+node_modules/
+package-lock.json
+index.html
