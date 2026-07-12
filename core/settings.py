@@ -14,9 +14,9 @@ SECRET_KEY = os.environ.get(
     'django-insecure-097_c*#=q04erb89w+51%80ifb1h0a^g#e+$5&7eu#t($jso(u'
 )
 
-DEBUG = True
+DEBUG = False
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = ["fastpay-production-b2c1.up.railway.app"]
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -51,11 +51,11 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
-
 CORS_ALLOWED_ORIGINS = [
+    "https://spectacular-kitsune-40a821.netlify.app",
     "http://localhost:5173",
-    "http://127.0.0.1:5173",
 ]
+
 
 ROOT_URLCONF = 'core.urls'
 
