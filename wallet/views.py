@@ -8,7 +8,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from notifications.utils import create_notification
 
-from .models import Wallet, Transaction, Beneficiary
+from .models import Wallet, Transaction, Beneficiary, Savings
 from .serializers import WalletSerializer
 from .banks import BANKS
 
@@ -518,4 +518,100 @@ class UpdatePhoneNumberView(APIView):
         return Response({
             "message": "Phone number updated successfully",
             "phone_number": wallet.phone_number
+            })
+
+class StartSavingsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        amount = request.data.get("amount")
+        plan = request.data.get("plan")
+        duration = request.data.get("duration")
+
+        if not amount or not plan or not duration:
+            return Response(
+                {"error": "Amount, plan and duration are required"},
+                status=400
+            )
+
+        try:
+            amount = Decimal(str(amount))
+        except:
+            return Response(
+                {"error": "Invalid amount"},
+                status=400
+            )
+
+        wallet = Wallet.objects.get(user=request.user)
+
+        if wallet.balance < amount:
+            return Response(
+                {"error": "Insufficient balance"},
+                status=400
+            )
+
+        wallet.balance -= amount
+        wallet.save()
+
+        savings = Savings.objects.create(
+            user=request.user,
+            amount=amount,
+            plan=plan,
+            duration=duration
+        )
+
+        Transaction.objects.create(
+            user=request.user,
+            amount=amount,
+            transaction_type="withdraw",
+            narration=f"FASTpay Akawo ({plan})"
+        )
+
+        create_notification(
+            user=request.user,
+            title="Savings Created",
+            message=f"You saved ₦{amount} into FASTpay Akawo."
+        )
+
+        return Response({
+            "message": "Savings created successfully",
+            "wallet_balance": str(wallet.balance),
+            "amount": str(savings.amount),
+            "plan": savings.plan,
+            "duration": savings.duration
         })
+
+class SavingsListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        savings = Savings.objects.filter(user=request.user)
+
+        total = Decimal("0")
+
+        for item in savings:
+            total += item.amount
+
+        return Response({
+            "balance": str(total)
+        })
+
+
+class SavingsHistoryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        savings = Savings.objects.filter(user=request.user).order_by("-id")
+
+        data = []
+
+        for item in savings:
+            data.append({
+                "id": item.id,
+                "amount": str(item.amount),
+                "plan": item.plan,
+                "duration": item.duration,
+                "date": item.created_at,
+            })
+
+        return Response(data)

@@ -192,3 +192,52 @@ def withdraw(wallet, amount, narration=""):
 
     return transaction
 
+class Savings(models.Model):
+    PLAN_TYPES = (
+        ("daily", "Daily"),
+        ("weekly", "Weekly"),
+        ("monthly", "Monthly"),
+        ("flexible", "Flexible"),
+    )
+
+    DURATION_TYPES = (
+        ("1 Month", "1 Month"),
+        ("3 Months", "3 Months"),
+        ("6 Months", "6 Months"),
+        ("12 Months", "12 Months"),
+    )
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE
+    )
+
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2
+    )
+
+    plan = models.CharField(
+        max_length=20,
+        choices=PLAN_TYPES
+    )
+
+    duration = models.CharField(
+        max_length=20,
+        choices=DURATION_TYPES
+    )
+
+    status = models.CharField(
+        max_length=20,
+        default="active"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    maturity_date = models.DateTimeField(
+        blank=True,
+        null=True
+    )
+
+    def __str__(self):
+        return f"{self.user.username} - ₦{self.amount}"
