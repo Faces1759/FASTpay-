@@ -21,7 +21,7 @@ urlpatterns = [
     path('vtu/', include('vtu.urls')),
     path("notifications/", include("notifications.urls")),
     path("akawo/", include ("akawo.urls")),
-    path("savings/", include("savings.urls")),
+    # path("savings/", include("savings.urls")),
 ]  
 
 if settings.DEBUG:
