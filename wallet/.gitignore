@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+db.sqlite3
+venv/
+env/
+*.egg-info/
+
+# Django
+media/
+staticfiles/
+
+# Environment variables
+.env
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (if any frontend files got mixed in here)
+node_modules/
+package-lock.json
