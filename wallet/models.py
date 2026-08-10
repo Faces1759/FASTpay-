@@ -12,6 +12,7 @@ from django.conf import settings
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
+
 class Wallet(models.Model):
     user = models.OneToOneField(
         settings.AUTH_USER_MODEL,
@@ -23,12 +24,12 @@ class Wallet(models.Model):
         blank=True,
         null=True
     )
-   
+
     phone_number = models.CharField(
-    max_length=15,
-    blank=True,
-    null=True
-)
+        max_length=15,
+        blank=True,
+        null=True
+    )
 
     pin_is_set = models.BooleanField(default=False)
 
@@ -52,18 +53,12 @@ class Wallet(models.Model):
         null=True
     )
 
-    transaction_pin = models.CharField(
-        max_length=4,
-        blank=True,
-        null=True
-    )
-
     balance = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         default=Decimal("0.00")
     )
-   
+
     is_active = models.BooleanField(default=True)
 
     held_balance = models.DecimalField(
@@ -115,8 +110,8 @@ class Wallet(models.Model):
             self.held_balance = Decimal("0.00")
         self.save()
 
-@receiver(post_save, sender=settings.AUTH_USER_MODEL)
 
+@receiver(post_save, sender=settings.AUTH_USER_MODEL)
 def create_wallet(sender, instance, created, **kwargs):
     if created:
         Wallet.objects.create(user=instance)
@@ -124,15 +119,15 @@ def create_wallet(sender, instance, created, **kwargs):
 
 class Transaction(models.Model):
     TRANSACTION_TYPES = (
-    ("deposit", "Deposit"),
-    ("withdraw", "Withdraw"),
-    ("transfer", "Transfer"),
-    ("airtime", "Airtime"),
-    ("data", "Data"),
-    ("card", "Card"),
-    ("bill", "Bill Payment"),
-)
-  
+        ("deposit", "Deposit"),
+        ("withdraw", "Withdraw"),
+        ("transfer", "Transfer"),
+        ("airtime", "Airtime"),
+        ("data", "Data"),
+        ("card", "Card"),
+        ("bill", "Bill Payment"),
+    )
+
     reference = models.CharField(
         max_length=20,
         unique=True,
@@ -229,6 +224,7 @@ def withdraw(wallet, amount, narration=""):
     )
 
     return transaction
+
 
 class Savings(models.Model):
     PLAN_TYPES = (
