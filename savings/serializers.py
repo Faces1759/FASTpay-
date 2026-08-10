@@ -1,9 +1,5 @@
 from rest_framework import serializers
-from .models import (
-    SavingsPlan,
-    SavingsDeposit,
-    SavingsWithdrawal,
-)
+from .models import SavingsPlan
 
 
 class SavingsPlanSerializer(serializers.ModelSerializer):
@@ -18,24 +14,4 @@ class SavingsPlanSerializer(serializers.ModelSerializer):
             "maturity_date",
             "first_deposit_taken",
             "created_at",
-        )
-
-
-class SavingsDepositSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = SavingsDeposit
-        fields = "__all__"
-        read_only_fields = (
-            "plan",
-            "deposited_at",
-        )
-
-
-class SavingsWithdrawalSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = SavingsWithdrawal
-        fields = "__all__"
-        read_only_fields = (
-            "plan",
-            "withdrawn_at",
         )
