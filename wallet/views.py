@@ -1,14 +1,23 @@
 from decimal import Decimal
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import make_password, check_password
 from django.core.mail import send_mail
 from django.conf import settings
+from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
+from datetime import timedelta
+import hashlib
+import hmac
+import json
+import requests
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from notifications.utils import create_notification
 
-from .models import Wallet, Transaction, Beneficiary, Savings
+from .models import Wallet, Transaction, Beneficiary, Savings, PendingDeposit
 from .serializers import WalletSerializer
 from .banks import BANKS
 
@@ -19,73 +28,149 @@ from django.http import HttpResponse
 User = get_user_model()
 
 
-class DepositView(APIView):
+class InitializeDepositView(APIView):
+    """
+    Starts a real deposit. Does NOT credit the wallet directly —
+    it asks Paystack to create a payment session and returns the
+    payment link. The wallet is only credited once Paystack confirms
+    the payment via webhook (see PaystackWebhookView below).
+    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         amount = request.data.get("amount")
+        callback_url = request.data.get("callback_url")
 
         if amount is None:
-            return Response(
-                {"error": "Amount is required"},
-                status=400
-            )
+            return Response({"error": "Amount is required"}, status=400)
 
         try:
             amount = Decimal(str(amount))
         except:
-            return Response(
-                {"error": "Invalid amount format"},
-                status=400
-            )
+            return Response({"error": "Invalid amount format"}, status=400)
 
         if amount <= 0:
-            return Response(
-                {"error": "Amount must be greater than 0"},
-                status=400
-            )
+            return Response({"error": "Amount must be greater than 0"}, status=400)
 
-        wallet, _ = Wallet.objects.get_or_create(
-            user=request.user
+        if not request.user.email:
+            return Response({"error": "Your account needs an email on file to deposit"}, status=400)
+
+        payload = {
+            "email": request.user.email,
+            "amount": int(amount * 100),  # Paystack expects kobo, not naira
+        }
+        if callback_url:
+            payload["callback_url"] = callback_url
+
+        paystack_response = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            headers={
+                "Authorization": f"Bearer {settings.PAYSTACK_SECRET_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
         )
 
-        wallet.balance += amount
-        wallet.save()
-        
-       # send_mail(
-#     subject="FASTpay Deposit Alert",
-#     message=f"""
-# Hello {request.user.username},
-#
-# Your wallet has been credited.
-#
-# Amount: ₦{amount}
-#
-# Available Balance: ₦{wallet.balance}
-#
-# Thank you for using FASTpay.
-# """,
-#     from_email=settings.DEFAULT_FROM_EMAIL,
-#     recipient_list=[request.user.email],
-#     fail_silently=False,
-# )
+        result = paystack_response.json()
 
-        Transaction.objects.create(
+        if not result.get("status"):
+            return Response({"error": "Unable to start deposit. Please try again."}, status=502)
+
+        reference = result["data"]["reference"]
+
+        PendingDeposit.objects.create(
             user=request.user,
+            reference=reference,
             amount=amount,
-            transaction_type="deposit"
-        )
-        
-        create_notification(
-             user=request.user,
-               title="Deposit Successful",
-                   message=f"₦{amount} has been credited to your FASTpay wallet."
         )
 
         return Response({
-            "message": "Deposit successful",
-            "balance": str(wallet.balance)
+            "authorization_url": result["data"]["authorization_url"],
+            "reference": reference,
         })
+
+
+class DepositStatusView(APIView):
+    """
+    Lets the frontend poll whether a specific deposit has been
+    confirmed yet by the Paystack webhook.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, reference):
+        try:
+            pending = PendingDeposit.objects.get(reference=reference, user=request.user)
+        except PendingDeposit.DoesNotExist:
+            return Response({"error": "Deposit not found"}, status=404)
+
+        return Response({
+            "verified": pending.verified,
+            "amount": str(pending.amount),
+        })
+
+
+class PaystackWebhookView(APIView):
+    """
+    Paystack calls this URL automatically after a payment completes.
+    This is the ONLY place a wallet gets credited for a deposit.
+    We verify the signature so nobody can fake this request themselves.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        signature = request.headers.get("x-paystack-signature", "")
+        computed_signature = hmac.new(
+            settings.PAYSTACK_SECRET_KEY.encode("utf-8"),
+            request.body,
+            hashlib.sha512,
+        ).hexdigest()
+
+        if not hmac.compare_digest(signature, computed_signature):
+            return Response(status=401)
+
+        event = json.loads(request.body)
+
+        if event.get("event") != "charge.success":
+            return Response(status=200)
+
+        reference = event["data"]["reference"]
+        amount_paid = Decimal(str(event["data"]["amount"])) / 100  # back to naira
+
+        try:
+            pending = PendingDeposit.objects.get(reference=reference)
+        except PendingDeposit.DoesNotExist:
+            return Response(status=200)
+
+        with transaction.atomic():
+            pending = PendingDeposit.objects.select_for_update().get(reference=reference)
+
+            if pending.verified:
+                return Response(status=200)  # already credited, don't double-credit
+
+            if amount_paid != pending.amount:
+                return Response(status=200)  # amount mismatch, don't credit — investigate manually
+
+            wallet, _ = Wallet.objects.select_for_update().get_or_create(user=pending.user)
+            wallet.balance += pending.amount
+            wallet.save()
+
+            pending.verified = True
+            pending.save()
+
+            Transaction.objects.create(
+                user=pending.user,
+                amount=pending.amount,
+                transaction_type="deposit",
+                reference=reference,
+            )
+
+            create_notification(
+                user=pending.user,
+                title="Deposit Successful",
+                message=f"₦{pending.amount} has been credited to your FASTpay wallet.",
+            )
+
+        return Response(status=200)
 
 
 class WithdrawView(APIView):
@@ -95,84 +180,49 @@ class WithdrawView(APIView):
         amount = request.data.get("amount")
 
         if amount is None:
-            return Response(
-                {"error": "Amount is required"},
-                status=400
-            )
+            return Response({"error": "Amount is required"}, status=400)
 
         try:
             amount = Decimal(str(amount))
         except:
-            return Response(
-                {"error": "Invalid amount format"},
-                status=400
-            )
+            return Response({"error": "Invalid amount format"}, status=400)
 
         if amount <= 0:
-            return Response(
-                {"error": "Amount must be greater than 0"},
-                status=400
+            return Response({"error": "Amount must be greater than 0"}, status=400)
+
+        with transaction.atomic():
+            wallet, _ = Wallet.objects.select_for_update().get_or_create(user=request.user)
+
+            if wallet.balance < amount:
+                return Response({"error": "Insufficient balance"}, status=400)
+
+            wallet.balance -= amount
+            wallet.save()
+
+            Transaction.objects.create(
+                user=request.user,
+                amount=amount,
+                transaction_type="withdraw"
             )
 
-        wallet, _ = Wallet.objects.get_or_create(
-            user=request.user
-        )
-
-        if wallet.balance < amount:
-            return Response(
-                {"error": "Insufficient balance"},
-                status=400
-            )
-
-        wallet.balance -= amount
-        wallet.save()
-        
-      # send_mail(
-#     subject="FASTpay Withdrawal Alert",
-#     message=f"""
-# Hello {request.user.username},
-#
-# Your FASTpay wallet has been debited successfully.
-#
-# Amount: ₦{amount}
-#
-# Available Balance: ₦{wallet.balance}
-#
-# Transaction Type: Withdrawal
-#
-# Thank you for using FASTpay.
-# """,
-#     from_email=settings.DEFAULT_FROM_EMAIL,
-#     recipient_list=[request.user.email],
-#     fail_silently=True,
-# )
-
-        Transaction.objects.create(
-            user=request.user,
-            amount=amount,
-            transaction_type="withdraw"
-        )
-        
         create_notification(
-    user=request.user,
-    title="Withdrawal Successful",
-    message=f"₦{amount} has been debited from your FASTpay wallet."
-)
+            user=request.user,
+            title="Withdrawal Successful",
+            message=f"₦{amount} has been debited from your FASTpay wallet."
+        )
 
         return Response({
             "message": "Withdrawal successful",
             "balance": str(wallet.balance)
         })
-        
+
+
 class WalletBalanceView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         wallet = Wallet.objects.get(user=request.user)
-
-        return Response({
-            "balance": wallet.balance
-        })
+        return Response({"balance": wallet.balance})
 
 
 class TransactionHistoryView(APIView):
@@ -203,6 +253,7 @@ class TransactionHistoryView(APIView):
 
         return Response(data)
 
+
 class TransferView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -213,82 +264,84 @@ class TransferView(APIView):
         pin = request.data.get("pin")
 
         if not account_number or not amount:
-            return Response(
-                {"error": "account_number and amount are required"},
-                status=400
-            )
+            return Response({"error": "account_number and amount are required"}, status=400)
+
+        if not pin:
+            return Response({"error": "Transaction PIN is required"}, status=400)
 
         try:
             amount = Decimal(str(amount))
         except:
-            return Response(
-                {"error": "Invalid amount format"},
-                status=400
-            )
+            return Response({"error": "Invalid amount format"}, status=400)
 
         if amount <= 0:
-            return Response(
-                {"error": "Amount must be greater than 0"},
-                status=400
+            return Response({"error": "Amount must be greater than 0"}, status=400)
+
+        with transaction.atomic():
+            # Lock both wallets in a consistent order (by id) to prevent deadlocks
+            # when two transfers happen between the same two accounts at once.
+            locked_wallets = list(
+                Wallet.objects.select_for_update().filter(
+                    Q(user=request.user) | Q(account_number=account_number)
+                ).order_by("id")
             )
 
-        try:
-            recipient_wallet = Wallet.objects.get(
-                account_number=account_number
-            )
+            sender_wallet = next((w for w in locked_wallets if w.user_id == request.user.id), None)
+            recipient_wallet = next((w for w in locked_wallets if w.account_number == account_number), None)
+
+            if not recipient_wallet:
+                return Response({"error": "Account number not found"}, status=404)
+
             recipient = recipient_wallet.user
 
-        except Wallet.DoesNotExist:
-            return Response(
-                {"error": "Account number not found"},
-                status=404
+            if recipient == request.user:
+                return Response({"error": "You cannot transfer to yourself"}, status=400)
+
+            if not sender_wallet.pin:
+                return Response({"error": "Please set your transaction PIN first"}, status=400)
+
+            # PIN lockout check
+            if sender_wallet.pin_locked_until and sender_wallet.pin_locked_until > timezone.now():
+                minutes_left = int((sender_wallet.pin_locked_until - timezone.now()).total_seconds() / 60) + 1
+                return Response(
+                    {"error": f"Too many wrong PIN attempts. Try again in {minutes_left} minute(s)."},
+                    status=403
+                )
+
+            # PIN check against the HASHED pin, not raw comparison
+            if not check_password(pin, sender_wallet.pin):
+                sender_wallet.failed_pin_attempts += 1
+                if sender_wallet.failed_pin_attempts >= 3:
+                    sender_wallet.pin_locked_until = timezone.now() + timedelta(minutes=5)
+                    sender_wallet.failed_pin_attempts = 0
+                sender_wallet.save()
+                return Response({"error": "Invalid transaction PIN"}, status=400)
+
+            # Correct PIN — reset the failed attempt counter
+            sender_wallet.failed_pin_attempts = 0
+
+            if sender_wallet.balance < amount:
+                return Response({"error": "Insufficient balance"}, status=400)
+
+            sender_wallet.balance -= amount
+            sender_wallet.save()
+
+            recipient_wallet.balance += amount
+            recipient_wallet.save()
+
+            Transaction.objects.create(
+                user=request.user,
+                amount=amount,
+                transaction_type="withdraw",
+                narration=narration
             )
 
-        if recipient == request.user:
-            return Response(
-                {"error": "You cannot transfer to yourself"},
-                status=400
+            Transaction.objects.create(
+                user=recipient,
+                amount=amount,
+                transaction_type="deposit",
+                narration=narration
             )
-
-        sender_wallet = Wallet.objects.get(user=request.user)
-
-        if not sender_wallet.pin:
-            return Response(
-                {"error": "Please set your transaction PIN first"},
-                status=400
-            )
-
-        if sender_wallet.pin != pin:
-            return Response(
-                {"error": "Invalid transaction PIN"},
-                status=400
-            )
-
-        if sender_wallet.balance < amount:
-            return Response(
-                {"error": "Insufficient balance"},
-                status=400
-            )
-
-        sender_wallet.balance -= amount
-        sender_wallet.save()
-
-        recipient_wallet.balance += amount
-        recipient_wallet.save()
-
-        Transaction.objects.create(
-            user=request.user,
-            amount=amount,
-            transaction_type="withdraw",
-            narration=narration
-        )
-
-        Transaction.objects.create(
-            user=recipient,
-            amount=amount,
-            transaction_type="deposit",
-            narration=narration
-        )
 
         create_notification(
             user=request.user,
@@ -310,29 +363,27 @@ class TransferView(APIView):
             "narration": narration,
             "balance": str(sender_wallet.balance)
         })
-        
+
+
 class BankListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        return Response({
-            "banks": BANKS
-        })
-        
+        return Response({"banks": BANKS})
+
+
 class AccountDetailsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        wallet, _ = Wallet.objects.get_or_create(
-            user=request.user
-        )
-
+        wallet, _ = Wallet.objects.get_or_create(user=request.user)
         return Response({
             "username": request.user.username,
             "account_number": wallet.account_number,
             "balance": str(wallet.balance)
         })
-        
+
+
 class SetPinView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -340,28 +391,20 @@ class SetPinView(APIView):
         pin = request.data.get("pin")
 
         if not pin:
-            return Response(
-                {"error": "PIN is required"},
-                status=400
-            )
+            return Response({"error": "PIN is required"}, status=400)
 
         if len(pin) != 4 or not pin.isdigit():
-            return Response(
-                {"error": "PIN must be exactly 4 digits"},
-                status=400
-            )
+            return Response({"error": "PIN must be exactly 4 digits"}, status=400)
 
-        wallet, _ = Wallet.objects.get_or_create(
-            user=request.user
-        )
-
-        wallet.pin = pin
+        wallet, _ = Wallet.objects.get_or_create(user=request.user)
+        wallet.pin = make_password(pin)  # hashed, never stored raw
+        wallet.failed_pin_attempts = 0
+        wallet.pin_locked_until = None
         wallet.save()
 
-        return Response({
-            "message": "Transaction PIN set successfully"
-        })
-        
+        return Response({"message": "Transaction PIN set successfully"})
+
+
 class AddBeneficiaryView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -370,18 +413,12 @@ class AddBeneficiaryView(APIView):
         account_number = request.data.get("account_number")
 
         if not nickname or not account_number:
-            return Response(
-                {"error": "nickname and account_number are required"},
-                status=400
-            )
+            return Response({"error": "nickname and account_number are required"}, status=400)
 
         try:
             Wallet.objects.get(account_number=account_number)
         except Wallet.DoesNotExist:
-            return Response(
-                {"error": "Account number not found"},
-                status=404
-            )
+            return Response({"error": "Account number not found"}, status=404)
 
         beneficiary = Beneficiary.objects.create(
             user=request.user,
@@ -394,57 +431,23 @@ class AddBeneficiaryView(APIView):
             "nickname": beneficiary.nickname,
             "account_number": beneficiary.account_number
         })
-        
-class AddBeneficiaryView(APIView):
-    permission_classes = [IsAuthenticated]
 
-    def post(self, request):
-        nickname = request.data.get("nickname")
-        account_number = request.data.get("account_number")
 
-        if not nickname or not account_number:
-            return Response(
-                {"error": "nickname and account_number are required"},
-                status=400
-            )
-
-        try:
-            Wallet.objects.get(account_number=account_number)
-        except Wallet.DoesNotExist:
-            return Response(
-                {"error": "Account number not found"},
-                status=404
-            )
-
-        beneficiary = Beneficiary.objects.create(
-            user=request.user,
-            nickname=nickname,
-            account_number=account_number
-        )
-
-        return Response({
-            "message": "Beneficiary added successfully",
-            "nickname": beneficiary.nickname,
-            "account_number": beneficiary.account_number
-        })
-        
 class BeneficiaryListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         beneficiaries = Beneficiary.objects.filter(user=request.user)
-
         data = []
-
         for beneficiary in beneficiaries:
             data.append({
                 "id": beneficiary.id,
                 "nickname": beneficiary.nickname,
                 "account_number": beneficiary.account_number,
             })
-
         return Response(data)
-    
+
+
 class DeleteBeneficiaryView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -452,50 +455,33 @@ class DeleteBeneficiaryView(APIView):
         beneficiary_id = request.data.get("id")
 
         if not beneficiary_id:
-            return Response(
-                {"error": "Beneficiary ID is required"},
-                status=400
-            )
+            return Response({"error": "Beneficiary ID is required"}, status=400)
 
         try:
-            beneficiary = Beneficiary.objects.get(
-                id=beneficiary_id,
-                user=request.user
-            )
+            beneficiary = Beneficiary.objects.get(id=beneficiary_id, user=request.user)
         except Beneficiary.DoesNotExist:
-            return Response(
-                {"error": "Beneficiary not found"},
-                status=404
-            )
+            return Response({"error": "Beneficiary not found"}, status=404)
 
         beneficiary.delete()
+        return Response({"message": "Beneficiary deleted successfully"})
 
-        return Response({
-            "message": "Beneficiary deleted successfully"
-        })
-        
+
 class QRCodeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         wallet = Wallet.objects.get(user=request.user)
-
         data = (
             f"FASTpay\n"
             f"Name: {request.user.username}\n"
             f"Account: {wallet.account_number}"
         )
-
         qr = qrcode.make(data)
-
         buffer = BytesIO()
         qr.save(buffer, format="PNG")
+        return HttpResponse(buffer.getvalue(), content_type="image/png")
 
-        return HttpResponse(
-            buffer.getvalue(),
-            content_type="image/png"
-        )
-        
+
 class UpdatePhoneNumberView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -503,22 +489,17 @@ class UpdatePhoneNumberView(APIView):
         phone_number = request.data.get("phone_number")
 
         if not phone_number:
-            return Response(
-                {"error": "Phone number is required"},
-                status=400
-            )
+            return Response({"error": "Phone number is required"}, status=400)
 
-        wallet, _ = Wallet.objects.get_or_create(
-            user=request.user
-        )
-
+        wallet, _ = Wallet.objects.get_or_create(user=request.user)
         wallet.phone_number = phone_number
         wallet.save()
 
         return Response({
             "message": "Phone number updated successfully",
             "phone_number": wallet.phone_number
-            })
+        })
+
 
 class StartSavingsView(APIView):
     permission_classes = [IsAuthenticated]
@@ -529,43 +510,35 @@ class StartSavingsView(APIView):
         duration = request.data.get("duration")
 
         if not amount or not plan or not duration:
-            return Response(
-                {"error": "Amount, plan and duration are required"},
-                status=400
-            )
+            return Response({"error": "Amount, plan and duration are required"}, status=400)
 
         try:
             amount = Decimal(str(amount))
         except:
-            return Response(
-                {"error": "Invalid amount"},
-                status=400
+            return Response({"error": "Invalid amount"}, status=400)
+
+        with transaction.atomic():
+            wallet = Wallet.objects.select_for_update().get(user=request.user)
+
+            if wallet.balance < amount:
+                return Response({"error": "Insufficient balance"}, status=400)
+
+            wallet.balance -= amount
+            wallet.save()
+
+            savings = Savings.objects.create(
+                user=request.user,
+                amount=amount,
+                plan=plan,
+                duration=duration
             )
 
-        wallet = Wallet.objects.get(user=request.user)
-
-        if wallet.balance < amount:
-            return Response(
-                {"error": "Insufficient balance"},
-                status=400
+            Transaction.objects.create(
+                user=request.user,
+                amount=amount,
+                transaction_type="withdraw",
+                narration=f"FASTpay Akawo ({plan})"
             )
-
-        wallet.balance -= amount
-        wallet.save()
-
-        savings = Savings.objects.create(
-            user=request.user,
-            amount=amount,
-            plan=plan,
-            duration=duration
-        )
-
-        Transaction.objects.create(
-            user=request.user,
-            amount=amount,
-            transaction_type="withdraw",
-            narration=f"FASTpay Akawo ({plan})"
-        )
 
         create_notification(
             user=request.user,
@@ -581,20 +554,16 @@ class StartSavingsView(APIView):
             "duration": savings.duration
         })
 
+
 class SavingsListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         savings = Savings.objects.filter(user=request.user)
-
         total = Decimal("0")
-
         for item in savings:
             total += item.amount
-
-        return Response({
-            "balance": str(total)
-        })
+        return Response({"balance": str(total)})
 
 
 class SavingsHistoryView(APIView):
@@ -602,9 +571,7 @@ class SavingsHistoryView(APIView):
 
     def get(self, request):
         savings = Savings.objects.filter(user=request.user).order_by("-id")
-
         data = []
-
         for item in savings:
             data.append({
                 "id": item.id,
@@ -613,5 +580,4 @@ class SavingsHistoryView(APIView):
                 "duration": item.duration,
                 "date": item.created_at,
             })
-
         return Response(data)

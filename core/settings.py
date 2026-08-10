@@ -57,6 +57,7 @@ MIDDLEWARE = [
 CORS_ALLOWED_ORIGINS = [
     "https://spectacular-kitsune-40a821.netlify.app",
     "https://fastpay-fastpay.netlify.app",
+    "https://fastpay-frontend-liard.vercel.app",
     "http://localhost:5173",
 ]
 

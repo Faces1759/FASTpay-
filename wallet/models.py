@@ -32,6 +32,13 @@ class Wallet(models.Model):
 
     pin_is_set = models.BooleanField(default=False)
 
+    failed_pin_attempts = models.IntegerField(default=0)
+
+    pin_locked_until = models.DateTimeField(
+        null=True,
+        blank=True
+    )
+
     account_number = models.CharField(
         max_length=10,
         unique=True,
@@ -272,3 +279,27 @@ class Savings(models.Model):
 
     def __str__(self):
         return f"{self.user.username} - ₦{self.amount}"
+
+
+class PendingDeposit(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE
+    )
+
+    reference = models.CharField(
+        max_length=100,
+        unique=True
+    )
+
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2
+    )
+
+    verified = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.user.username} - {self.reference} ({'verified' if self.verified else 'pending'})"
