@@ -29,12 +29,6 @@ User = get_user_model()
 
 
 class InitializeDepositView(APIView):
-    """
-    Starts a real deposit. Does NOT credit the wallet directly —
-    it asks Paystack to create a payment session and returns the
-    payment link. The wallet is only credited once Paystack confirms
-    the payment via webhook (see PaystackWebhookView below).
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -57,7 +51,7 @@ class InitializeDepositView(APIView):
 
         payload = {
             "email": request.user.email,
-            "amount": int(amount * 100),  # Paystack expects kobo, not naira
+            "amount": int(amount * 100),
         }
         if callback_url:
             payload["callback_url"] = callback_url
@@ -91,10 +85,6 @@ class InitializeDepositView(APIView):
 
 
 class DepositStatusView(APIView):
-    """
-    Lets the frontend poll whether a specific deposit has been
-    confirmed yet by the Paystack webhook.
-    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request, reference):
@@ -110,11 +100,6 @@ class DepositStatusView(APIView):
 
 
 class VerifyAccountView(APIView):
-    """
-    Checks a bank account number against Paystack's records and
-    returns the account holder's real name, so the user can confirm
-    they're sending money to the right person before withdrawing.
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -138,7 +123,7 @@ class VerifyAccountView(APIView):
         result = paystack_response.json()
 
         if not result.get("status"):
-            return Response({"error": "Could not verify this account. Please check the details."}, status=400)
+            return Response({"error": f"Paystack said: {result.get('message', 'Unknown error')}"}, status=400)
 
         return Response({
             "account_number": result["data"]["account_number"],
@@ -147,13 +132,6 @@ class VerifyAccountView(APIView):
 
 
 class InitiateWithdrawalView(APIView):
-    """
-    Withdraws money OUT of FASTpay to an external bank account, via
-    Paystack Transfers. The wallet balance is only HELD here (not
-    deducted) — it's only permanently deducted once Paystack confirms
-    the transfer succeeded (see PaystackWebhookView). If the transfer
-    fails, the held funds are released back to the user automatically.
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -207,7 +185,6 @@ class InitiateWithdrawalView(APIView):
             if wallet.available_balance() < amount:
                 return Response({"error": "Insufficient balance"}, status=400)
 
-            # Create a Paystack transfer recipient for this account
             recipient_response = requests.post(
                 "https://api.paystack.co/transferrecipient",
                 headers={
@@ -229,11 +206,8 @@ class InitiateWithdrawalView(APIView):
 
             recipient_code = recipient_result["data"]["recipient_code"]
 
-            # Hold the funds now, before calling Paystack, so the user
-            # can't spend the same money twice while the transfer is pending
             wallet.hold_funds(amount)
 
-            # Initiate the actual transfer
             transfer_response = requests.post(
                 "https://api.paystack.co/transfer",
                 headers={
@@ -242,7 +216,7 @@ class InitiateWithdrawalView(APIView):
                 },
                 json={
                     "source": "balance",
-                    "amount": int(amount * 100),  # kobo
+                    "amount": int(amount * 100),
                     "recipient": recipient_code,
                     "reason": "FASTpay withdrawal",
                 },
@@ -250,7 +224,6 @@ class InitiateWithdrawalView(APIView):
             transfer_result = transfer_response.json()
 
             if not transfer_result.get("status"):
-                # Transfer failed to even start — give the held funds back
                 wallet.release_funds(amount)
                 return Response({"error": "Unable to start withdrawal. Please try again."}, status=502)
 
@@ -272,12 +245,6 @@ class InitiateWithdrawalView(APIView):
 
 
 class PaystackWebhookView(APIView):
-    """
-    Paystack calls this URL automatically after a payment or transfer
-    completes. This is the ONLY place a wallet gets credited for a
-    deposit, or permanently debited for a withdrawal. We verify the
-    signature so nobody can fake this request themselves.
-    """
     permission_classes = [AllowAny]
 
     def post(self, request):
@@ -296,7 +263,7 @@ class PaystackWebhookView(APIView):
 
         if event_type == "charge.success":
             reference = event["data"]["reference"]
-            amount_paid = Decimal(str(event["data"]["amount"])) / 100  # back to naira
+            amount_paid = Decimal(str(event["data"]["amount"])) / 100
 
             try:
                 pending = PendingDeposit.objects.get(reference=reference)
@@ -307,10 +274,10 @@ class PaystackWebhookView(APIView):
                 pending = PendingDeposit.objects.select_for_update().get(reference=reference)
 
                 if pending.verified:
-                    return Response(status=200)  # already credited, don't double-credit
+                    return Response(status=200)
 
                 if amount_paid != pending.amount:
-                    return Response(status=200)  # amount mismatch, don't credit — investigate manually
+                    return Response(status=200)
 
                 wallet, _ = Wallet.objects.select_for_update().get_or_create(user=pending.user)
                 wallet.balance += pending.amount
@@ -346,7 +313,7 @@ class PaystackWebhookView(APIView):
                 pending = PendingWithdrawal.objects.select_for_update().get(reference=reference)
 
                 if pending.status == "success":
-                    return Response(status=200)  # already processed
+                    return Response(status=200)
 
                 wallet = Wallet.objects.select_for_update().get(user=pending.user)
                 wallet.deduct_held_funds(pending.amount)
@@ -382,7 +349,7 @@ class PaystackWebhookView(APIView):
                 pending = PendingWithdrawal.objects.select_for_update().get(reference=reference)
 
                 if pending.status in ("failed", "success"):
-                    return Response(status=200)  # already processed
+                    return Response(status=200)
 
                 wallet = Wallet.objects.select_for_update().get(user=pending.user)
                 wallet.release_funds(pending.amount)
@@ -506,8 +473,6 @@ class TransferView(APIView):
             return Response({"error": "Amount must be greater than 0"}, status=400)
 
         with transaction.atomic():
-            # Lock both wallets in a consistent order (by id) to prevent deadlocks
-            # when two transfers happen between the same two accounts at once.
             locked_wallets = list(
                 Wallet.objects.select_for_update().filter(
                     Q(user=request.user) | Q(account_number=account_number)
@@ -528,7 +493,6 @@ class TransferView(APIView):
             if not sender_wallet.pin:
                 return Response({"error": "Please set your transaction PIN first"}, status=400)
 
-            # PIN lockout check
             if sender_wallet.pin_locked_until and sender_wallet.pin_locked_until > timezone.now():
                 minutes_left = int((sender_wallet.pin_locked_until - timezone.now()).total_seconds() / 60) + 1
                 return Response(
@@ -536,7 +500,6 @@ class TransferView(APIView):
                     status=403
                 )
 
-            # PIN check against the HASHED pin, not raw comparison
             if not check_password(pin, sender_wallet.pin):
                 sender_wallet.failed_pin_attempts += 1
                 if sender_wallet.failed_pin_attempts >= 3:
@@ -545,7 +508,6 @@ class TransferView(APIView):
                 sender_wallet.save()
                 return Response({"error": "Invalid transaction PIN"}, status=400)
 
-            # Correct PIN — reset the failed attempt counter
             sender_wallet.failed_pin_attempts = 0
 
             if sender_wallet.balance < amount:
@@ -625,7 +587,7 @@ class SetPinView(APIView):
             return Response({"error": "PIN must be exactly 4 digits"}, status=400)
 
         wallet, _ = Wallet.objects.get_or_create(user=request.user)
-        wallet.pin = make_password(pin)  # hashed, never stored raw
+        wallet.pin = make_password(pin)
         wallet.failed_pin_attempts = 0
         wallet.pin_locked_until = None
         wallet.save()
