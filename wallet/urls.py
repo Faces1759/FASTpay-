@@ -4,6 +4,8 @@ from .views import (
     DepositStatusView,
     PaystackWebhookView,
     WithdrawView,
+    VerifyAccountView,
+    InitiateWithdrawalView,
     BankListView,
     WalletBalanceView,
     TransactionHistoryView,
@@ -20,12 +22,15 @@ from .views import (
     SavingsListView,
     SavingsHistoryView,
 )
+
 urlpatterns = [
     # Wallet
     path("deposit/", InitializeDepositView.as_view()),
     path("deposit/status/<str:reference>/", DepositStatusView.as_view()),
     path("paystack/webhook/", PaystackWebhookView.as_view()),
     path("withdraw/", WithdrawView.as_view()),
+    path("verify-account/", VerifyAccountView.as_view()),
+    path("withdraw-external/", InitiateWithdrawalView.as_view()),
     path("balance/", WalletBalanceView.as_view()),
     path("transfer/", TransferView.as_view()),
     path("account/", AccountDetailsView.as_view()),

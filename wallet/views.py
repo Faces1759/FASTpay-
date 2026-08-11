@@ -17,7 +17,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from notifications.utils import create_notification
 
-from .models import Wallet, Transaction, Beneficiary, Savings, PendingDeposit
+from .models import Wallet, Transaction, Beneficiary, Savings, PendingDeposit, PendingWithdrawal
 from .serializers import WalletSerializer
 from .banks import BANKS
 
@@ -109,11 +109,174 @@ class DepositStatusView(APIView):
         })
 
 
+class VerifyAccountView(APIView):
+    """
+    Checks a bank account number against Paystack's records and
+    returns the account holder's real name, so the user can confirm
+    they're sending money to the right person before withdrawing.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        account_number = request.data.get("account_number")
+        bank_code = request.data.get("bank_code")
+
+        if not account_number or not bank_code:
+            return Response({"error": "account_number and bank_code are required"}, status=400)
+
+        paystack_response = requests.get(
+            "https://api.paystack.co/bank/resolve",
+            headers={
+                "Authorization": f"Bearer {settings.PAYSTACK_SECRET_KEY}",
+            },
+            params={
+                "account_number": account_number,
+                "bank_code": bank_code,
+            },
+        )
+
+        result = paystack_response.json()
+
+        if not result.get("status"):
+            return Response({"error": "Could not verify this account. Please check the details."}, status=400)
+
+        return Response({
+            "account_number": result["data"]["account_number"],
+            "account_name": result["data"]["account_name"],
+        })
+
+
+class InitiateWithdrawalView(APIView):
+    """
+    Withdraws money OUT of FASTpay to an external bank account, via
+    Paystack Transfers. The wallet balance is only HELD here (not
+    deducted) — it's only permanently deducted once Paystack confirms
+    the transfer succeeded (see PaystackWebhookView). If the transfer
+    fails, the held funds are released back to the user automatically.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        account_number = request.data.get("account_number")
+        bank_code = request.data.get("bank_code")
+        account_name = request.data.get("account_name")
+        amount = request.data.get("amount")
+        pin = request.data.get("pin")
+
+        if not account_number or not bank_code or not account_name:
+            return Response({"error": "account_number, bank_code and account_name are required"}, status=400)
+
+        if not pin:
+            return Response({"error": "Transaction PIN is required"}, status=400)
+
+        if amount is None:
+            return Response({"error": "Amount is required"}, status=400)
+
+        try:
+            amount = Decimal(str(amount))
+        except:
+            return Response({"error": "Invalid amount format"}, status=400)
+
+        if amount <= 0:
+            return Response({"error": "Amount must be greater than 0"}, status=400)
+
+        with transaction.atomic():
+            wallet = Wallet.objects.select_for_update().get(user=request.user)
+
+            if not wallet.pin:
+                return Response({"error": "Please set your transaction PIN first"}, status=400)
+
+            if wallet.pin_locked_until and wallet.pin_locked_until > timezone.now():
+                minutes_left = int((wallet.pin_locked_until - timezone.now()).total_seconds() / 60) + 1
+                return Response(
+                    {"error": f"Too many wrong PIN attempts. Try again in {minutes_left} minute(s)."},
+                    status=403
+                )
+
+            if not check_password(pin, wallet.pin):
+                wallet.failed_pin_attempts += 1
+                if wallet.failed_pin_attempts >= 3:
+                    wallet.pin_locked_until = timezone.now() + timedelta(minutes=5)
+                    wallet.failed_pin_attempts = 0
+                wallet.save()
+                return Response({"error": "Invalid transaction PIN"}, status=400)
+
+            wallet.failed_pin_attempts = 0
+            wallet.save()
+
+            if wallet.available_balance() < amount:
+                return Response({"error": "Insufficient balance"}, status=400)
+
+            # Create a Paystack transfer recipient for this account
+            recipient_response = requests.post(
+                "https://api.paystack.co/transferrecipient",
+                headers={
+                    "Authorization": f"Bearer {settings.PAYSTACK_SECRET_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "type": "nuban",
+                    "name": account_name,
+                    "account_number": account_number,
+                    "bank_code": bank_code,
+                    "currency": "NGN",
+                },
+            )
+            recipient_result = recipient_response.json()
+
+            if not recipient_result.get("status"):
+                return Response({"error": "Could not set up this recipient. Please try again."}, status=502)
+
+            recipient_code = recipient_result["data"]["recipient_code"]
+
+            # Hold the funds now, before calling Paystack, so the user
+            # can't spend the same money twice while the transfer is pending
+            wallet.hold_funds(amount)
+
+            # Initiate the actual transfer
+            transfer_response = requests.post(
+                "https://api.paystack.co/transfer",
+                headers={
+                    "Authorization": f"Bearer {settings.PAYSTACK_SECRET_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "source": "balance",
+                    "amount": int(amount * 100),  # kobo
+                    "recipient": recipient_code,
+                    "reason": "FASTpay withdrawal",
+                },
+            )
+            transfer_result = transfer_response.json()
+
+            if not transfer_result.get("status"):
+                # Transfer failed to even start — give the held funds back
+                wallet.release_funds(amount)
+                return Response({"error": "Unable to start withdrawal. Please try again."}, status=502)
+
+            reference = transfer_result["data"]["reference"]
+
+            PendingWithdrawal.objects.create(
+                user=request.user,
+                reference=reference,
+                amount=amount,
+                account_number=account_number,
+                bank_code=bank_code,
+                account_name=account_name,
+            )
+
+        return Response({
+            "message": "Withdrawal initiated. You'll be notified once it's complete.",
+            "reference": reference,
+        })
+
+
 class PaystackWebhookView(APIView):
     """
-    Paystack calls this URL automatically after a payment completes.
-    This is the ONLY place a wallet gets credited for a deposit.
-    We verify the signature so nobody can fake this request themselves.
+    Paystack calls this URL automatically after a payment or transfer
+    completes. This is the ONLY place a wallet gets credited for a
+    deposit, or permanently debited for a withdrawal. We verify the
+    signature so nobody can fake this request themselves.
     """
     permission_classes = [AllowAny]
 
@@ -129,46 +292,111 @@ class PaystackWebhookView(APIView):
             return Response(status=401)
 
         event = json.loads(request.body)
+        event_type = event.get("event")
 
-        if event.get("event") != "charge.success":
+        if event_type == "charge.success":
+            reference = event["data"]["reference"]
+            amount_paid = Decimal(str(event["data"]["amount"])) / 100  # back to naira
+
+            try:
+                pending = PendingDeposit.objects.get(reference=reference)
+            except PendingDeposit.DoesNotExist:
+                return Response(status=200)
+
+            with transaction.atomic():
+                pending = PendingDeposit.objects.select_for_update().get(reference=reference)
+
+                if pending.verified:
+                    return Response(status=200)  # already credited, don't double-credit
+
+                if amount_paid != pending.amount:
+                    return Response(status=200)  # amount mismatch, don't credit — investigate manually
+
+                wallet, _ = Wallet.objects.select_for_update().get_or_create(user=pending.user)
+                wallet.balance += pending.amount
+                wallet.save()
+
+                pending.verified = True
+                pending.save()
+
+                Transaction.objects.create(
+                    user=pending.user,
+                    amount=pending.amount,
+                    transaction_type="deposit",
+                    reference=reference,
+                )
+
+                create_notification(
+                    user=pending.user,
+                    title="Deposit Successful",
+                    message=f"₦{pending.amount} has been credited to your FASTpay wallet.",
+                )
+
             return Response(status=200)
 
-        reference = event["data"]["reference"]
-        amount_paid = Decimal(str(event["data"]["amount"])) / 100  # back to naira
+        elif event_type == "transfer.success":
+            reference = event["data"]["reference"]
 
-        try:
-            pending = PendingDeposit.objects.get(reference=reference)
-        except PendingDeposit.DoesNotExist:
+            try:
+                pending = PendingWithdrawal.objects.get(reference=reference)
+            except PendingWithdrawal.DoesNotExist:
+                return Response(status=200)
+
+            with transaction.atomic():
+                pending = PendingWithdrawal.objects.select_for_update().get(reference=reference)
+
+                if pending.status == "success":
+                    return Response(status=200)  # already processed
+
+                wallet = Wallet.objects.select_for_update().get(user=pending.user)
+                wallet.deduct_held_funds(pending.amount)
+
+                pending.status = "success"
+                pending.save()
+
+                Transaction.objects.create(
+                    user=pending.user,
+                    amount=pending.amount,
+                    transaction_type="withdraw",
+                    reference=reference,
+                    narration=f"Withdrawal to {pending.account_name} ({pending.account_number})",
+                )
+
+                create_notification(
+                    user=pending.user,
+                    title="Withdrawal Successful",
+                    message=f"₦{pending.amount} has been sent to {pending.account_name}.",
+                )
+
             return Response(status=200)
 
-        with transaction.atomic():
-            pending = PendingDeposit.objects.select_for_update().get(reference=reference)
+        elif event_type == "transfer.failed" or event_type == "transfer.reversed":
+            reference = event["data"]["reference"]
 
-            if pending.verified:
-                return Response(status=200)  # already credited, don't double-credit
+            try:
+                pending = PendingWithdrawal.objects.get(reference=reference)
+            except PendingWithdrawal.DoesNotExist:
+                return Response(status=200)
 
-            if amount_paid != pending.amount:
-                return Response(status=200)  # amount mismatch, don't credit — investigate manually
+            with transaction.atomic():
+                pending = PendingWithdrawal.objects.select_for_update().get(reference=reference)
 
-            wallet, _ = Wallet.objects.select_for_update().get_or_create(user=pending.user)
-            wallet.balance += pending.amount
-            wallet.save()
+                if pending.status in ("failed", "success"):
+                    return Response(status=200)  # already processed
 
-            pending.verified = True
-            pending.save()
+                wallet = Wallet.objects.select_for_update().get(user=pending.user)
+                wallet.release_funds(pending.amount)
 
-            Transaction.objects.create(
-                user=pending.user,
-                amount=pending.amount,
-                transaction_type="deposit",
-                reference=reference,
-            )
+                pending.status = "failed"
+                pending.save()
 
-            create_notification(
-                user=pending.user,
-                title="Deposit Successful",
-                message=f"₦{pending.amount} has been credited to your FASTpay wallet.",
-            )
+                create_notification(
+                    user=pending.user,
+                    title="Withdrawal Failed",
+                    message=f"Your withdrawal of ₦{pending.amount} could not be completed. The funds have been returned to your wallet.",
+                )
+
+            return Response(status=200)
 
         return Response(status=200)
 
