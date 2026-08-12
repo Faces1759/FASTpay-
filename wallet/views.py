@@ -202,7 +202,7 @@ class InitiateWithdrawalView(APIView):
             recipient_result = recipient_response.json()
 
             if not recipient_result.get("status"):
-                return Response({"error": "Could not set up this recipient. Please try again."}, status=502)
+                return Response({"error": f"Paystack recipient error: {recipient_result.get('message', 'Unknown error')}"}, status=502)
 
             recipient_code = recipient_result["data"]["recipient_code"]
 
@@ -225,7 +225,7 @@ class InitiateWithdrawalView(APIView):
 
             if not transfer_result.get("status"):
                 wallet.release_funds(amount)
-                return Response({"error": "Unable to start withdrawal. Please try again."}, status=502)
+                return Response({"error": f"Paystack transfer error: {transfer_result.get('message', 'Unknown error')}"}, status=502)
 
             reference = transfer_result["data"]["reference"]
 
@@ -447,7 +447,6 @@ class TransactionHistoryView(APIView):
             })
 
         return Response(data)
-
 
 class TransferView(APIView):
     permission_classes = [IsAuthenticated]
