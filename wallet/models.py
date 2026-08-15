@@ -185,6 +185,12 @@ class Beneficiary(models.Model):
 
     account_number = models.CharField(max_length=10)
 
+    account_type = models.CharField(
+        max_length=10,
+        choices=(("savings", "Savings"), ("current", "Current")),
+        default="savings"
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -322,6 +328,12 @@ class PendingWithdrawal(models.Model):
     bank_code = models.CharField(max_length=10)
 
     account_name = models.CharField(max_length=100)
+
+    account_type = models.CharField(
+        max_length=10,
+        choices=(("savings", "Savings"), ("current", "Current")),
+        default="savings"
+    )
 
     status = models.CharField(
         max_length=20,
